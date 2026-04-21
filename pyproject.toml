@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cosyvoice-win-jobs"
+version = "0.1.0"
+description = "Windows-hosted polling jobs wrapper around CosyVoice2 for stable zero-shot audiobook synthesis."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+  {name = "alboro"}
+]
+dependencies = [
+  "fastapi>=0.115,<1.0",
+  "uvicorn>=0.34,<1.0",
+  "pydantic>=2.9,<3.0",
+]
+
+[project.scripts]
+cosyvoice-win = "cosyvoice_win.cli:main"
+cosyvoice-win-server = "cosyvoice_win.server:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

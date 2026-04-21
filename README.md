@@ -1,0 +1,211 @@
+# cosyvoice-win-jobs
+
+Minimal polling jobs server for **CosyVoice2** on a Windows host.
+
+This repo is deliberately narrow. It is meant for one job:
+
+- stable long-form voice cloning for audiobook-style pipelines
+- Windows-hosted deployment
+- shared local voice references
+- async jobs API with polling
+
+The key design choice is different from the Qwen experiment:
+
+- do **not** recompute the speaker embedding for every request when possible
+- build a cached `zero_shot_spk_id` once
+- reuse that cached speaker across requests for better timbre consistency
+
+That mirrors the official CosyVoice2 examples, where a zero-shot speaker can be added once and reused later.
+
+## Why this repo exists
+
+For audiobook work, per-request quality is not enough. We also need:
+
+- consistent timbre from chunk to chunk
+- predictable async jobs
+- an API that a separate orchestrator can poll
+
+Official CosyVoice already provides the core inference logic and an official FastAPI runtime. This wrapper keeps the official inference path, but adds a simpler Windows-hosted jobs interface inspired by `xtts-win-jobs`.
+
+## Official CosyVoice notes that shaped this wrapper
+
+According to the official CosyVoice repo:
+
+- CosyVoice 2 supports Russian
+- CosyVoice 2 supports zero-shot and cross-lingual voice cloning
+- CosyVoice provides FastAPI and gRPC deployment examples
+- the official examples show saving a zero-shot speaker and reusing it later with `zero_shot_spk_id`
+- the official examples also note that for CosyVoice2 demo-style output you may want `text_frontend=False`
+
+For this reason this wrapper defaults to:
+
+- `mode=zero_shot`
+- `text_frontend=false`
+- `speed=1.0`
+- voice cache reuse by `voice`
+
+## Recommendation for your hardware
+
+For a Windows machine with **RTX 3070 Ti 8GB**, the most realistic first deployment is:
+
+- Windows host
+- WSL2 Ubuntu recommended for the actual model runtime
+- `CosyVoice2-0.5B`
+- `fp16=true`
+- `load_vllm=false`
+- `load_trt=false`
+- `load_jit=false`
+
+Native Windows may work, but I would treat it as the experimental path. WSL2 is the safer operational target.
+
+## Features
+
+- polling jobs API: `POST /v1/tts/jobs`, `GET /v1/tts/jobs/{id}`, `GET /v1/tts/jobs/{id}/audio`
+- shared voice discovery from `shared/`
+- sidecar prompt text discovery for zero-shot cloning
+- zero-shot speaker caching by `voice` id
+- persisted job metadata under `.data/jobs/`
+- persisted voice metadata under `.data/voices/`
+- simple local CLI for direct synthesis
+
+## Shared voice layout
+
+Put reference bundles into `shared/` like this:
+
+- `reference_long.wav`
+- `reference_long.txt`
+
+Or:
+
+- `anna_take2.flac`
+- `anna_take2.txt`
+
+When you submit a job with `"voice": "reference_long"`, the server will:
+
+1. find the newest matching audio file
+2. find the matching sidecar text
+3. create or refresh the zero-shot speaker cache
+4. synthesize future chunks using the cached speaker id
+
+That cache-first behavior is the main quality lever for chunk-to-chunk consistency.
+
+## API
+
+### Create job
+
+```json
+POST /v1/tts/jobs
+{
+  "input": "Это тестовая фраза.",
+  "model": "CosyVoice2-0.5B",
+  "voice": "reference_long",
+  "response_format": "wav",
+  "mode": "zero_shot",
+  "text_frontend": false,
+  "speed": 1.0
+}
+```
+
+### Create job with uploaded reference
+
+```json
+POST /v1/tts/jobs
+{
+  "input": "Это тестовая фраза.",
+  "model": "CosyVoice2-0.5B",
+  "voice": "reference_long",
+  "response_format": "wav",
+  "mode": "zero_shot",
+  "text_frontend": false,
+  "speed": 1.0,
+  "reference_audio_base64": "<base64-or-data-uri>",
+  "reference_audio_filename": "reference.wav",
+  "reference_text": "Точный текст референса."
+}
+```
+
+### Poll status
+
+```cmd
+curl http://127.0.0.1:8040/v1/tts/jobs/<job_id>
+```
+
+### Download audio
+
+```cmd
+curl http://127.0.0.1:8040/v1/tts/jobs/<job_id>/audio --output result.wav
+```
+
+## epub_to_audiobook integration
+
+This project is intentionally compatible with the polling style already used in `epub_to_audiobook`.
+
+Typical settings on that side would look like:
+
+```ini
+[tts]
+tts = openai
+voice_name = reference_long
+output_format = wav
+model_name = CosyVoice2-0.5B
+speed = 1.0
+
+[tts.openai]
+openai_base_url = http://desktop-6l3hnor.local:8040
+openai_enable_polling = true
+openai_submit_url = /v1/tts/jobs
+openai_status_url_template = /v1/tts/jobs/{job_id}
+openai_download_url_template = /v1/tts/jobs/{job_id}/audio
+openai_job_id_path = id
+openai_job_status_path = status
+openai_poll_interval = 5
+openai_poll_timeout = 14400
+openai_submit_omit_fields = instructions
+openai_submit_extra_fields = {"mode":"zero_shot","text_frontend":false}
+```
+
+If the voice cache already exists on the server, `voice_name` alone is enough. If not, you first seed the cache with a shared `voice.wav + voice.txt` pair or a request that includes uploaded reference audio and `reference_text`.
+
+## Installation idea
+
+This wrapper expects the official CosyVoice codebase to be available under `vendor/CosyVoice/`.
+
+The included bootstrap script is designed to:
+
+1. clone the official repo
+2. create a dedicated conda env with Python 3.10
+3. install official CosyVoice requirements
+4. install this wrapper in editable mode
+
+Model weights are not committed. Put them under:
+
+- `pretrained_models/CosyVoice2-0.5B`
+
+## Quick Start
+
+```cmd
+scripts\bootstrap_windows.cmd
+cosyvoice-win-server.cmd --host 127.0.0.1 --port 8040
+```
+
+Then place a reference bundle into `shared/` and submit a job.
+
+## Caveats
+
+- This wrapper does not try to be a universal OpenAI TTS clone.
+- `response_format` is currently `wav` only.
+- `mode=zero_shot` is the primary path for audiobook use.
+- `cross_lingual` is supported as an alternative mode.
+- `instruct2` is intentionally not wired in this first version because cached-speaker reuse around instruct mode is less predictable than zero-shot reuse.
+
+## Sources
+
+- Official CosyVoice repo: [FunAudioLLM/CosyVoice](https://github.com/FunAudioLLM/CosyVoice)
+- Official example usage showing `add_zero_shot_spk` and `save_spkinfo`
+- Official deployment docs describing FastAPI/grpc runtime
+
+## License
+
+MIT for the wrapper code in this repository.
+
+CosyVoice itself and its models keep their own licenses.
