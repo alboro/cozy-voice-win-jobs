@@ -78,9 +78,10 @@ class CreateTTSJobRequest(BaseModel):
     model: str = Field(default=DEFAULT_MODEL_ID)
     voice: str = Field(default="reference")
     response_format: str = Field(default="wav")
-    mode: str | None = Field(default=None, pattern="^(zero_shot|cross_lingual)$")
+    mode: str | None = Field(default=None, pattern="^(zero_shot|cross_lingual|instruct2)$")
     text_frontend: bool | None = None
     speed: float | None = Field(default=None, gt=0)
+    instruct_text: str | None = None
     reference_audio_base64: str | None = None
     reference_audio_filename: str | None = None
     reference_text: str | None = None
@@ -199,6 +200,7 @@ class JobStore:
             "mode": request.mode,
             "text_frontend": request.text_frontend,
             "speed": request.speed,
+            "instruct_text": request.instruct_text,
             "reference_text": request.reference_text,
             "force_rebuild_voice": request.force_rebuild_voice,
             "metadata": request.metadata or {},
@@ -503,6 +505,7 @@ class SynthesisWorker:
             mode=str(payload.get("mode") or self.settings.mode),
             text_frontend=_pick_override(payload.get("text_frontend"), self.settings.text_frontend),
             speed=float(_pick_override(payload.get("speed"), self.settings.speed)),
+            instruct_text=(payload.get("instruct_text") or None),
             stream=False,
         )
 
@@ -544,10 +547,22 @@ class SynthesisWorker:
         else:
             prompt_source = profile_text_source
 
+        mode = str(payload.get("mode") or self.settings.mode)
+        if prompt_audio_path is not None and mode in {"cross_lingual", "instruct2"}:
+            return (
+                ResolvedReference(
+                    audio_path=prompt_audio_path,
+                    prompt_text=prompt_text or None,
+                    reference_source_label=f"direct {mode} reference",
+                    prompt_source_label=prompt_source,
+                ),
+                None,
+            )
+
         should_seed_cache = force_rebuild or voice_id not in self._seeded_voice_ids
         if prompt_audio_path is not None and should_seed_cache:
             prompt_audio_16k = load_prompt_audio_16k(prompt_audio_path)
-            if str(payload.get("mode") or self.settings.mode) == "zero_shot" and not prompt_text:
+            if mode == "zero_shot" and not prompt_text:
                 raise ValueError("zero_shot mode requires reference_text or a sidecar transcript for the shared voice.")
             ensure_zero_shot_speaker(
                 cosyvoice_model,
@@ -590,17 +605,6 @@ class SynthesisWorker:
                 self.voices.profile_path(voice_id),
             )
 
-        if prompt_audio_path is not None and str(payload.get("mode") or self.settings.mode) == "cross_lingual":
-            return (
-                ResolvedReference(
-                    audio_path=prompt_audio_path,
-                    prompt_text=prompt_text or None,
-                    reference_source_label="direct cross_lingual reference",
-                    prompt_source_label=prompt_source,
-                ),
-                None,
-            )
-
         if profile is not None:
             raise ValueError(
                 f"Voice '{voice_id}' has stored metadata, but its reference audio is unavailable for cache restore."
@@ -624,7 +628,7 @@ def parse_args(argv: list[str] | None = None) -> ServerSettings:
     parser.add_argument("--voices-dir", default=str(DEFAULT_VOICES_DIR))
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument("--model-dir", default=str(DEFAULT_MODEL_DIR))
-    parser.add_argument("--mode", choices=("zero_shot", "cross_lingual"), default=DEFAULT_MODE)
+    parser.add_argument("--mode", choices=("zero_shot", "cross_lingual", "instruct2"), default=DEFAULT_MODE)
     parser.add_argument(
         "--text-frontend",
         choices=("on", "off"),
@@ -732,6 +736,7 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             mode=request.mode or server_settings.mode,
             text_frontend=_pick_override(request.text_frontend, server_settings.text_frontend),
             speed=_pick_override(request.speed, server_settings.speed),
+            instruct_text=(request.instruct_text or "").strip() or None,
             reference_audio_base64=request.reference_audio_base64,
             reference_audio_filename=request.reference_audio_filename,
             reference_text=(request.reference_text or "").strip() or None,
