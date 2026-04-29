@@ -37,7 +37,11 @@ if "fastapi" not in sys.modules:
     )
 
 if "fastapi.responses" not in sys.modules:
-    sys.modules["fastapi.responses"] = types.SimpleNamespace(FileResponse=object)
+    sys.modules["fastapi.responses"] = types.SimpleNamespace(
+        FileResponse=object,
+        Response=object,
+        StreamingResponse=object,
+    )
 
 if "pydantic" not in sys.modules:
     class _DummyBaseModel:
@@ -71,11 +75,19 @@ if "cosyvoice_win.cli" not in sys.modules:
         parse_on_off=lambda value: bool(value) if isinstance(value, bool) else str(value).lower() == "on",
         resolve_dir=lambda value: Path(value),
         resolve_model_dir=lambda value: Path(value),
+        iter_synthesis=lambda *args, **kwargs: iter(()),
         synthesize_to_file=lambda *args, **kwargs: 1,
     )
     sys.modules["cosyvoice_win.cli"] = fake_cli
 
-from cosyvoice_win.server import JobStore, VoiceStore
+from cosyvoice_win.server import (
+    SUPPORTED_DIRECT_RESPONSE_FORMATS,
+    SUPPORTED_JOB_RESPONSE_FORMATS,
+    JobStore,
+    VoiceStore,
+    audio_media_type,
+    wav_header,
+)
 
 
 class DummyRequest:
@@ -89,6 +101,8 @@ class DummyRequest:
         mode: str | None = None,
         text_frontend: bool | None = None,
         speed: float | None = None,
+        stream: bool | None = None,
+        instructions: str | None = None,
         instruct_text: str | None = None,
         reference_audio_base64: str | None = None,
         reference_audio_filename: str | None = None,
@@ -103,6 +117,8 @@ class DummyRequest:
         self.mode = mode
         self.text_frontend = text_frontend
         self.speed = speed
+        self.stream = stream
+        self.instructions = instructions
         self.instruct_text = instruct_text
         self.reference_audio_base64 = reference_audio_base64
         self.reference_audio_filename = reference_audio_filename
@@ -184,6 +200,23 @@ class TestVoiceStore(unittest.TestCase):
             loaded = store.get("reference_long")
             self.assertEqual(loaded["voice"], "reference_long")
             self.assertTrue(loaded["reference_text_present"])
+
+
+class TestDirectAudioHelpers(unittest.TestCase):
+    def test_direct_endpoint_supports_pcm_without_changing_job_formats(self):
+        self.assertEqual(SUPPORTED_JOB_RESPONSE_FORMATS, {"wav"})
+        self.assertIn("wav", SUPPORTED_DIRECT_RESPONSE_FORMATS)
+        self.assertIn("pcm", SUPPORTED_DIRECT_RESPONSE_FORMATS)
+        self.assertEqual(audio_media_type("pcm"), "audio/pcm; codecs=pcm_s16le")
+        self.assertEqual(audio_media_type("wav"), "audio/wav")
+
+    def test_streaming_wav_header_uses_unknown_length_placeholder(self):
+        header = wav_header(24000)
+
+        self.assertEqual(header[:4], b"RIFF")
+        self.assertEqual(header[8:12], b"WAVE")
+        self.assertEqual(int.from_bytes(header[4:8], "little"), 0xFFFFFFFF)
+        self.assertEqual(int.from_bytes(header[40:44], "little"), 0xFFFFFFFF)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ This repo is deliberately narrow. It is meant for one job:
 - Windows-hosted deployment
 - shared local voice references
 - async jobs API with polling
+- OpenAI-style direct speech endpoint with optional streaming
 
 The key design choice is different from the Qwen experiment:
 
@@ -71,6 +72,7 @@ Current native Windows smoke status:
 ## Features
 
 - polling jobs API: `POST /v1/tts/jobs`, `GET /v1/tts/jobs/{id}`, `GET /v1/tts/jobs/{id}/audio`
+- direct OpenAI-style API: `POST /v1/audio/speech`
 - shared voice discovery from `shared/`
 - sidecar prompt text discovery for zero-shot cloning
 - zero-shot speaker caching by `voice` id
@@ -112,6 +114,7 @@ POST /v1/tts/jobs
   "response_format": "wav",
   "mode": "zero_shot",
   "text_frontend": false,
+  "fix_question_intonation": true,
   "speed": 1.0
 }
 ```
@@ -127,12 +130,48 @@ POST /v1/tts/jobs
   "response_format": "wav",
   "mode": "zero_shot",
   "text_frontend": false,
+  "fix_question_intonation": true,
   "speed": 1.0,
   "reference_audio_base64": "<base64-or-data-uri>",
   "reference_audio_filename": "reference.wav",
   "reference_text": "Точный текст референса."
 }
 ```
+
+### Direct OpenAI-style speech
+
+```json
+POST /v1/audio/speech
+{
+  "input": "Это тестовая фраза.",
+  "model": "Fun-CosyVoice3-0.5B",
+  "voice": "reference_long",
+  "response_format": "wav",
+  "mode": "zero_shot",
+  "text_frontend": false,
+  "fix_question_intonation": true,
+  "speed": 1.0
+}
+```
+
+This endpoint returns audio bytes directly. It supports:
+
+- `response_format="wav"` for regular clients
+- `response_format="pcm"` for raw signed 16-bit PCM
+- `stream=true` for chunked transfer as CosyVoice yields audio segments
+
+The polling jobs API still only stores and returns WAV files.
+
+Question-ending texts have one extra wrapper rule by default:
+
+- `fix_question_intonation=true`
+- if a `zero_shot` request ends with `?` or `?"` or similar closing quotes/brackets after `?`
+- the wrapper auto-promotes that request to `instruct2`
+- and injects a hidden instruction telling CosyVoice to read the target text with question intonation
+
+This is meant to compensate for CosyVoice often under-playing question marks in long-form reading.
+
+Send `"fix_question_intonation": false` if you want to disable that behavior for a specific request.
 
 ### Poll status
 
@@ -171,12 +210,14 @@ openai_job_status_path = status
 openai_poll_interval = 5
 openai_poll_timeout = 14400
 openai_submit_omit_fields = instructions
-openai_submit_extra_fields = {"mode":"zero_shot","text_frontend":false}
+openai_submit_extra_fields = {"mode":"zero_shot","text_frontend":false,"fix_question_intonation":true}
 ```
 
 If the voice cache already exists on the server, `voice_name` alone is enough. If not, you first seed the cache with a shared `voice.wav + voice.txt` pair or a request that includes uploaded reference audio and `reference_text`.
 
 For CosyVoice3 the wrapper automatically adds the required `<|endofprompt|>` marker to prompt/instruction text before calling the official runtime.
+
+If you send `instructions`, the wrapper auto-promotes a `zero_shot` request to `instruct2` so the instruction stays separate from the spoken `input`.
 
 ## Installation idea
 
