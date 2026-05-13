@@ -169,6 +169,28 @@ instruction text into generated speech.
 `fix_question_intonation=true` only appends the question-intonation helper to
 explicit `instruct2` requests. Plain `zero_shot` requests ignore instructions.
 
+### OpenAI-style transcription
+
+```cmd
+curl http://127.0.0.1:8040/v1/audio/transcriptions ^
+  -F "file=@input.wav" ^
+  -F "model=whisper-1" ^
+  -F "language=ru" ^
+  -F "response_format=json"
+```
+
+The endpoint uses `faster-whisper` with `large-v3` on CUDA by default. It accepts
+the OpenAI-compatible `whisper-1` model alias and also accepts `large-v3`
+directly. Supported response formats are `json`, `text`, and `verbose_json`.
+
+TTS and transcription share one process-wide GPU lock, so CosyVoice and Whisper
+do not run CUDA inference at the same time. By default Whisper is unloaded after
+each transcription request to return VRAM to TTS. Override with:
+
+```cmd
+cosyvoice-win-server.cmd --unload-transcription-after-request off
+```
+
 ### Poll status
 
 ```cmd

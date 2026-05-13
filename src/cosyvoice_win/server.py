@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import gc as py_gc
 import json
 import logging
+import os
 import queue
 import shutil
 import struct
@@ -20,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -61,8 +63,13 @@ DEFAULT_JOB_OUTPUT_NAME = "audio.wav"
 DEFAULT_JOB_RETENTION_HOURS = 24
 DEFAULT_DOWNLOADED_JOB_RETENTION_HOURS = 6
 DEFAULT_CLEANUP_INTERVAL_SECONDS = 900
+DEFAULT_TRANSCRIPTION_MODEL = "large-v3"
+DEFAULT_TRANSCRIPTION_DEVICE = "cuda"
+DEFAULT_TRANSCRIPTION_COMPUTE_TYPE = "float16"
+DEFAULT_UNLOAD_TRANSCRIPTION_AFTER_REQUEST = True
 SUPPORTED_JOB_RESPONSE_FORMATS = {"wav"}
 SUPPORTED_DIRECT_RESPONSE_FORMATS = {"wav", "pcm"}
+SUPPORTED_TRANSCRIPTION_RESPONSE_FORMATS = {"json", "text", "verbose_json"}
 
 AUDIO_MIME_TO_EXT = {
     "audio/wav": ".wav",
@@ -119,11 +126,21 @@ class ServerSettings:
     job_retention_hours: int = DEFAULT_JOB_RETENTION_HOURS
     downloaded_job_retention_hours: int = DEFAULT_DOWNLOADED_JOB_RETENTION_HOURS
     cleanup_interval_seconds: int = DEFAULT_CLEANUP_INTERVAL_SECONDS
+    transcription_model: str = DEFAULT_TRANSCRIPTION_MODEL
+    transcription_device: str = DEFAULT_TRANSCRIPTION_DEVICE
+    transcription_compute_type: str = DEFAULT_TRANSCRIPTION_COMPUTE_TYPE
+    unload_transcription_after_request: bool = DEFAULT_UNLOAD_TRANSCRIPTION_AFTER_REQUEST
 
 
 @dataclass(slots=True)
 class LoadedModel:
     tts: Any
+    load_seconds: float
+
+
+@dataclass(slots=True)
+class LoadedTranscriptionModel:
+    model: Any
     load_seconds: float
 
 
@@ -455,10 +472,17 @@ class JobGarbageCollector:
 
 
 class SynthesisWorker:
-    def __init__(self, settings: ServerSettings, store: JobStore, voices: VoiceStore):
+    def __init__(
+        self,
+        settings: ServerSettings,
+        store: JobStore,
+        voices: VoiceStore,
+        gpu_lock: threading.Lock,
+    ):
         self.settings = settings
         self.store = store
         self.voices = voices
+        self._gpu_lock = gpu_lock
         self._queue: queue.Queue[str] = queue.Queue()
         self._thread = threading.Thread(target=self._run, name="cosyvoice-job-worker", daemon=True)
         self._loaded_model: LoadedModel | None = None
@@ -525,25 +549,26 @@ class SynthesisWorker:
                 synthesis_started = time.perf_counter()
 
                 with self._synthesis_lock:
-                    with redirect_stdout(log_file), redirect_stderr(log_file):
-                        loaded_model = self._ensure_model()
-                    log_line(log_file, f"Model ready in {loaded_model.load_seconds:.2f}s")
+                    with self._gpu_lock:
+                        with redirect_stdout(log_file), redirect_stderr(log_file):
+                            loaded_model = self._ensure_model()
+                        log_line(log_file, f"Model ready in {loaded_model.load_seconds:.2f}s")
 
-                    with redirect_stdout(log_file), redirect_stderr(log_file):
-                        reference, voice_profile_path = self._prepare_voice(
-                            loaded_model.tts,
-                            voice_id=voice_id,
-                            job_id=job_id,
-                            payload=payload,
-                        )
-                        segments_returned = synthesize_to_file(
-                            loaded_model.tts,
-                            text=str(payload["input"]).strip(),
-                            voice_id=voice_id,
-                            reference=reference,
-                            output_path=output_path,
-                            options=options,
-                        )
+                        with redirect_stdout(log_file), redirect_stderr(log_file):
+                            reference, voice_profile_path = self._prepare_voice(
+                                loaded_model.tts,
+                                voice_id=voice_id,
+                                job_id=job_id,
+                                payload=payload,
+                            )
+                            segments_returned = synthesize_to_file(
+                                loaded_model.tts,
+                                text=str(payload["input"]).strip(),
+                                voice_id=voice_id,
+                                reference=reference,
+                                output_path=output_path,
+                                options=options,
+                            )
 
                 synthesis_seconds = time.perf_counter() - synthesis_started
                 wall_seconds = time.perf_counter() - runtime_started
@@ -618,21 +643,22 @@ class SynthesisWorker:
         voice_id = str(payload["voice"]).strip() or "reference"
         options = self._build_job_synthesis_options(payload)
         with self._synthesis_lock:
-            loaded_model = self._ensure_model()
-            reference, _voice_profile_path = self._prepare_voice(
-                loaded_model.tts,
-                voice_id=voice_id,
-                job_id=None,
-                payload=payload,
-                uploaded_reference=uploaded_reference,
-            )
-            yield from iter_synthesis(
-                loaded_model.tts,
-                text=str(payload["input"]).strip(),
-                voice_id=voice_id,
-                reference=reference,
-                options=options,
-            )
+            with self._gpu_lock:
+                loaded_model = self._ensure_model()
+                reference, _voice_profile_path = self._prepare_voice(
+                    loaded_model.tts,
+                    voice_id=voice_id,
+                    job_id=None,
+                    payload=payload,
+                    uploaded_reference=uploaded_reference,
+                )
+                yield from iter_synthesis(
+                    loaded_model.tts,
+                    text=str(payload["input"]).strip(),
+                    voice_id=voice_id,
+                    reference=reference,
+                    options=options,
+                )
 
     def synthesize_direct_bytes(
         self,
@@ -641,11 +667,28 @@ class SynthesisWorker:
         response_format: str,
         uploaded_reference: Path | None = None,
     ) -> bytes:
-        outputs = list(self.iter_direct_synthesis(payload, uploaded_reference=uploaded_reference))
-        loaded_model = self._loaded_model
-        if loaded_model is None:
-            raise RuntimeError("CosyVoice model was not loaded.")
-        return render_audio_bytes(outputs, loaded_model.tts.sample_rate, response_format)
+        voice_id = str(payload["voice"]).strip() or "reference"
+        options = self._build_job_synthesis_options(payload)
+        with self._synthesis_lock:
+            with self._gpu_lock:
+                loaded_model = self._ensure_model()
+                reference, _voice_profile_path = self._prepare_voice(
+                    loaded_model.tts,
+                    voice_id=voice_id,
+                    job_id=None,
+                    payload=payload,
+                    uploaded_reference=uploaded_reference,
+                )
+                outputs = list(
+                    iter_synthesis(
+                        loaded_model.tts,
+                        text=str(payload["input"]).strip(),
+                        voice_id=voice_id,
+                        reference=reference,
+                        options=options,
+                    )
+                )
+                return render_audio_bytes(outputs, loaded_model.tts.sample_rate, response_format)
 
     def stream_direct_audio(
         self,
@@ -657,26 +700,27 @@ class SynthesisWorker:
         voice_id = str(payload["voice"]).strip() or "reference"
         options = self._build_job_synthesis_options(payload)
         with self._synthesis_lock:
-            loaded_model = self._ensure_model()
-            reference, _voice_profile_path = self._prepare_voice(
-                loaded_model.tts,
-                voice_id=voice_id,
-                job_id=None,
-                payload=payload,
-                uploaded_reference=uploaded_reference,
-            )
-            if response_format.lower() == "wav":
-                yield wav_header(loaded_model.tts.sample_rate)
-            for output in iter_synthesis(
-                loaded_model.tts,
-                text=str(payload["input"]).strip(),
-                voice_id=voice_id,
-                reference=reference,
-                options=options,
-            ):
-                chunk = output_to_pcm16_bytes(output)
-                if chunk:
-                    yield chunk
+            with self._gpu_lock:
+                loaded_model = self._ensure_model()
+                reference, _voice_profile_path = self._prepare_voice(
+                    loaded_model.tts,
+                    voice_id=voice_id,
+                    job_id=None,
+                    payload=payload,
+                    uploaded_reference=uploaded_reference,
+                )
+                if response_format.lower() == "wav":
+                    yield wav_header(loaded_model.tts.sample_rate)
+                for output in iter_synthesis(
+                    loaded_model.tts,
+                    text=str(payload["input"]).strip(),
+                    voice_id=voice_id,
+                    reference=reference,
+                    options=options,
+                ):
+                    chunk = output_to_pcm16_bytes(output)
+                    if chunk:
+                        yield chunk
 
     def _prepare_voice(
         self,
@@ -794,6 +838,130 @@ class SynthesisWorker:
         )
 
 
+class TranscriptionService:
+    def __init__(self, settings: ServerSettings, gpu_lock: threading.Lock):
+        self.settings = settings
+        self._gpu_lock = gpu_lock
+        self._loaded_model: LoadedTranscriptionModel | None = None
+        self._lock = threading.Lock()
+
+    def _ensure_model(self) -> LoadedTranscriptionModel:
+        if self._loaded_model is not None:
+            return self._loaded_model
+
+        # Torch/CosyVoice and CTranslate2 can load different OpenMP runtimes on
+        # native Windows. Without this guard faster-whisper may abort the whole
+        # process with "libiomp5md.dll already initialized" before raising Python
+        # exceptions.
+        if sys.platform == "win32":
+            os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError as exc:
+            raise RuntimeError(
+                "faster-whisper is not installed. Install project dependencies again before using "
+                "/v1/audio/transcriptions."
+            ) from exc
+
+        started = time.perf_counter()
+        model = WhisperModel(
+            self.settings.transcription_model,
+            device=self.settings.transcription_device,
+            compute_type=self.settings.transcription_compute_type,
+        )
+        self._loaded_model = LoadedTranscriptionModel(
+            model=model,
+            load_seconds=time.perf_counter() - started,
+        )
+        return self._loaded_model
+
+    def _unload_model(self) -> None:
+        if self._loaded_model is None:
+            return
+        self._loaded_model = None
+        py_gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                try:
+                    torch.cuda.ipc_collect()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def transcribe(
+        self,
+        audio_path: Path,
+        *,
+        language: str | None = None,
+        prompt: str | None = None,
+        temperature: float = 0.0,
+    ) -> dict[str, Any]:
+        language_code = normalize_language_code(language)
+        with self._lock:
+            with self._gpu_lock:
+                loaded_model = self._ensure_model()
+                try:
+                    started = time.perf_counter()
+                    segments_iter, info = loaded_model.model.transcribe(
+                        str(audio_path),
+                        language=language_code,
+                        initial_prompt=(prompt or "").strip() or None,
+                        task="transcribe",
+                        temperature=float(temperature or 0.0),
+                    )
+                    segments = [transcription_segment_to_dict(segment) for segment in segments_iter]
+                    transcription_seconds = time.perf_counter() - started
+                    text = "".join(segment["text"] for segment in segments).strip()
+                    return {
+                        "text": text,
+                        "task": "transcribe",
+                        "language": getattr(info, "language", language_code or None),
+                        "duration": getattr(info, "duration", None),
+                        "segments": segments,
+                        "model": self.settings.transcription_model,
+                        "device": self.settings.transcription_device,
+                        "compute_type": self.settings.transcription_compute_type,
+                        "model_load_seconds": loaded_model.load_seconds,
+                        "transcription_seconds": transcription_seconds,
+                        "unloaded_after_request": self.settings.unload_transcription_after_request,
+                    }
+                finally:
+                    if self.settings.unload_transcription_after_request:
+                        try:
+                            del loaded_model
+                        except UnboundLocalError:
+                            pass
+                        self._unload_model()
+
+
+def normalize_language_code(language: str | None) -> str | None:
+    value = (language or "").strip()
+    if not value:
+        return None
+    return value.split("-", 1)[0].lower()
+
+
+def transcription_segment_to_dict(segment: Any) -> dict[str, Any]:
+    tokens = getattr(segment, "tokens", None)
+    return {
+        "id": getattr(segment, "id", None),
+        "seek": getattr(segment, "seek", None),
+        "start": float(getattr(segment, "start", 0.0) or 0.0),
+        "end": float(getattr(segment, "end", 0.0) or 0.0),
+        "text": str(getattr(segment, "text", "") or ""),
+        "tokens": list(tokens) if tokens is not None else None,
+        "temperature": getattr(segment, "temperature", None),
+        "avg_logprob": getattr(segment, "avg_logprob", None),
+        "compression_ratio": getattr(segment, "compression_ratio", None),
+        "no_speech_prob": getattr(segment, "no_speech_prob", None),
+    }
+
+
 def parse_args(argv: list[str] | None = None) -> ServerSettings:
     parser = argparse.ArgumentParser(
         prog="cosyvoice-win-server",
@@ -829,6 +997,15 @@ def parse_args(argv: list[str] | None = None) -> ServerSettings:
         default=DEFAULT_DOWNLOADED_JOB_RETENTION_HOURS,
     )
     parser.add_argument("--cleanup-interval-seconds", type=int, default=DEFAULT_CLEANUP_INTERVAL_SECONDS)
+    parser.add_argument("--transcription-model", default=DEFAULT_TRANSCRIPTION_MODEL)
+    parser.add_argument("--transcription-device", default=DEFAULT_TRANSCRIPTION_DEVICE)
+    parser.add_argument("--transcription-compute-type", default=DEFAULT_TRANSCRIPTION_COMPUTE_TYPE)
+    parser.add_argument(
+        "--unload-transcription-after-request",
+        choices=("on", "off"),
+        default="on" if DEFAULT_UNLOAD_TRANSCRIPTION_AFTER_REQUEST else "off",
+        help="Unload faster-whisper after each transcription request to free VRAM (default: on).",
+    )
     args = parser.parse_args(argv)
     return ServerSettings(
         host=args.host,
@@ -849,6 +1026,10 @@ def parse_args(argv: list[str] | None = None) -> ServerSettings:
         job_retention_hours=max(args.job_retention_hours, 0),
         downloaded_job_retention_hours=max(args.downloaded_job_retention_hours, 0),
         cleanup_interval_seconds=max(args.cleanup_interval_seconds, 1),
+        transcription_model=args.transcription_model,
+        transcription_device=args.transcription_device,
+        transcription_compute_type=args.transcription_compute_type,
+        unload_transcription_after_request=parse_on_off(args.unload_transcription_after_request),
     )
 
 
@@ -861,7 +1042,9 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
     )
     store = JobStore(server_settings.jobs_dir)
     voices = VoiceStore(server_settings.voices_dir)
-    worker = SynthesisWorker(server_settings, store, voices)
+    gpu_lock = threading.Lock()
+    worker = SynthesisWorker(server_settings, store, voices, gpu_lock)
+    transcriber = TranscriptionService(server_settings, gpu_lock)
     gc = JobGarbageCollector(server_settings, store)
 
     @asynccontextmanager
@@ -876,6 +1059,8 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
     app.state.store = store
     app.state.voices = voices
     app.state.worker = worker
+    app.state.transcriber = transcriber
+    app.state.gpu_lock = gpu_lock
     app.state.gc = gc
 
     @app.get("/health")
@@ -896,7 +1081,69 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             "fp16": server_settings.fp16,
             "job_retention_hours": server_settings.job_retention_hours,
             "downloaded_job_retention_hours": server_settings.downloaded_job_retention_hours,
+            "transcription_model": server_settings.transcription_model,
+            "transcription_device": server_settings.transcription_device,
+            "transcription_compute_type": server_settings.transcription_compute_type,
+            "unload_transcription_after_request": server_settings.unload_transcription_after_request,
         }
+
+    @app.post("/v1/audio/transcriptions")
+    def create_audio_transcription(
+        file: UploadFile = File(...),
+        model: str = Form(default="whisper-1"),
+        language: str | None = Form(default=None),
+        prompt: str | None = Form(default=None),
+        response_format: str = Form(default="json"),
+        temperature: float = Form(default=0.0),
+    ):
+        response_format_normalized = (response_format or "json").strip().lower()
+        if response_format_normalized not in SUPPORTED_TRANSCRIPTION_RESPONSE_FORMATS:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Only response_format='json', 'text', or 'verbose_json' is currently supported.",
+            )
+
+        requested_model = (model or "whisper-1").strip()
+        if requested_model not in {"whisper-1", server_settings.transcription_model}:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Only model 'whisper-1' aliasing '{server_settings.transcription_model}' "
+                    f"or '{server_settings.transcription_model}' is currently supported."
+                ),
+            )
+
+        suffix = infer_reference_suffix(file.filename, file.content_type)
+        audio_path = Path(tempfile.gettempdir()) / f"cosyvoice-transcribe-{uuid.uuid4().hex}{suffix}"
+        try:
+            with audio_path.open("wb") as handle:
+                shutil.copyfileobj(file.file, handle)
+            if audio_path.stat().st_size <= 0:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded audio file is empty.")
+
+            try:
+                result = transcriber.transcribe(
+                    audio_path,
+                    language=language,
+                    prompt=prompt,
+                    temperature=temperature,
+                )
+            except RuntimeError as exc:
+                raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+            except Exception as exc:
+                logger.exception("Audio transcription failed.")
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+
+            if response_format_normalized == "text":
+                return Response(content=result["text"], media_type="text/plain; charset=utf-8")
+            if response_format_normalized == "verbose_json":
+                return result
+            return {"text": result["text"]}
+        finally:
+            try:
+                audio_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     @app.post("/v1/tts/jobs", status_code=status.HTTP_202_ACCEPTED)
     def create_tts_job(request: CreateTTSJobRequest) -> dict[str, Any]:

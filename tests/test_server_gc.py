@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,14 +26,25 @@ if "fastapi" not in sys.modules:
         def post(self, *args, **kwargs):
             return lambda func: func
 
+    def _dummy_file(default=None, **kwargs):
+        return default
+
+    def _dummy_form(default=None, **kwargs):
+        return default
+
     sys.modules["fastapi"] = types.SimpleNamespace(
         FastAPI=_DummyFastAPI,
+        File=_dummy_file,
+        Form=_dummy_form,
         HTTPException=Exception,
+        UploadFile=object,
         status=types.SimpleNamespace(
             HTTP_202_ACCEPTED=202,
             HTTP_400_BAD_REQUEST=400,
             HTTP_404_NOT_FOUND=404,
             HTTP_409_CONFLICT=409,
+            HTTP_500_INTERNAL_SERVER_ERROR=500,
+            HTTP_503_SERVICE_UNAVAILABLE=503,
         ),
     )
 
@@ -55,6 +67,7 @@ if "pydantic" not in sys.modules:
 if "cosyvoice_win.cli" not in sys.modules:
     fake_cli = types.SimpleNamespace(
         DEFAULT_FP16=True,
+        DEFAULT_FIX_QUESTION_INTONATION=False,
         DEFAULT_MODEL_DIR=FAKE_PROJECT_ROOT / "pretrained_models" / "CosyVoice2-0.5B",
         DEFAULT_MODEL_ID="CosyVoice2-0.5B",
         DEFAULT_MODE="zero_shot",
@@ -70,10 +83,12 @@ if "cosyvoice_win.cli" not in sys.modules:
         find_reference_audio_in_shared=lambda *args, **kwargs: FAKE_PROJECT_ROOT / "shared" / "reference.wav",
         find_reference_text_for_audio=lambda *args, **kwargs: ("prompt", str(FAKE_PROJECT_ROOT / "shared" / "reference.txt")),
         format_duration=lambda seconds: f"{seconds:.1f}s",
+        build_runtime_instruction_text=lambda **kwargs: None,
         load_model=lambda *args, **kwargs: object(),
         load_prompt_audio_16k=lambda *args, **kwargs: object(),
         parse_on_off=lambda value: bool(value) if isinstance(value, bool) else str(value).lower() == "on",
         resolve_dir=lambda value: Path(value),
+        resolve_effective_mode=lambda mode, **kwargs: mode,
         resolve_model_dir=lambda value: Path(value),
         iter_synthesis=lambda *args, **kwargs: iter(()),
         synthesize_to_file=lambda *args, **kwargs: 1,
@@ -84,8 +99,12 @@ from cosyvoice_win.server import (
     SUPPORTED_DIRECT_RESPONSE_FORMATS,
     SUPPORTED_JOB_RESPONSE_FORMATS,
     JobStore,
+    LoadedTranscriptionModel,
+    ServerSettings,
+    TranscriptionService,
     VoiceStore,
     audio_media_type,
+    create_app,
     wav_header,
 )
 
@@ -217,6 +236,125 @@ class TestDirectAudioHelpers(unittest.TestCase):
         self.assertEqual(header[8:12], b"WAVE")
         self.assertEqual(int.from_bytes(header[4:8], "little"), 0xFFFFFFFF)
         self.assertEqual(int.from_bytes(header[40:44], "little"), 0xFFFFFFFF)
+
+
+class TestTranscriptionEndpoint(unittest.TestCase):
+    def test_transcription_service_unloads_model_after_request_by_default(self):
+        class Segment:
+            id = 0
+            seek = 0
+            start = 0.0
+            end = 1.0
+            text = " hello"
+            tokens = []
+            temperature = 0.0
+            avg_logprob = -0.1
+            compression_ratio = 1.0
+            no_speech_prob = 0.0
+
+        class Info:
+            language = "en"
+            duration = 1.0
+
+        class DummyWhisper:
+            def transcribe(self, *args, **kwargs):
+                return iter([Segment()]), Info()
+
+        service = TranscriptionService(ServerSettings(), threading.Lock())
+        service._loaded_model = LoadedTranscriptionModel(DummyWhisper(), 0.01)
+
+        result = service.transcribe(Path("dummy.wav"))
+
+        self.assertEqual(result["text"], "hello")
+        self.assertTrue(result["unloaded_after_request"])
+        self.assertIsNone(service._loaded_model)
+
+    def test_transcription_service_can_keep_model_loaded(self):
+        class Segment:
+            id = 0
+            seek = 0
+            start = 0.0
+            end = 1.0
+            text = " hello"
+            tokens = []
+            temperature = 0.0
+            avg_logprob = -0.1
+            compression_ratio = 1.0
+            no_speech_prob = 0.0
+
+        class Info:
+            language = "en"
+            duration = 1.0
+
+        class DummyWhisper:
+            def transcribe(self, *args, **kwargs):
+                return iter([Segment()]), Info()
+
+        service = TranscriptionService(
+            ServerSettings(unload_transcription_after_request=False),
+            threading.Lock(),
+        )
+        loaded_model = LoadedTranscriptionModel(DummyWhisper(), 0.01)
+        service._loaded_model = loaded_model
+
+        result = service.transcribe(Path("dummy.wav"))
+
+        self.assertEqual(result["text"], "hello")
+        self.assertFalse(result["unloaded_after_request"])
+        self.assertIs(service._loaded_model, loaded_model)
+
+    def test_tts_and_transcription_share_gpu_lock(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            app = create_app(
+                ServerSettings(
+                    shared_dir=root / "shared",
+                    jobs_dir=root / "jobs",
+                    voices_dir=root / "voices",
+                    model_dir=root / "model",
+                )
+            )
+
+            self.assertIs(app.state.worker._gpu_lock, app.state.gpu_lock)
+            self.assertIs(app.state.transcriber._gpu_lock, app.state.gpu_lock)
+
+    def test_transcription_endpoint_returns_openai_json_shape(self):
+        try:
+            from fastapi.testclient import TestClient
+        except Exception as exc:
+            self.skipTest(f"FastAPI TestClient unavailable: {exc}")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            app = create_app(
+                ServerSettings(
+                    shared_dir=root / "shared",
+                    jobs_dir=root / "jobs",
+                    voices_dir=root / "voices",
+                    model_dir=root / "model",
+                )
+            )
+
+            def fake_transcribe(audio_path, **kwargs):
+                self.assertTrue(Path(audio_path).is_file())
+                self.assertEqual(kwargs["language"], "ru")
+                return {"text": "hello from whisper"}
+
+            app.state.transcriber.transcribe = fake_transcribe
+
+            with TestClient(app) as client:
+                response = client.post(
+                    "/v1/audio/transcriptions",
+                    data={
+                        "model": "whisper-1",
+                        "language": "ru",
+                        "response_format": "json",
+                    },
+                    files={"file": ("sample.wav", b"RIFFfake", "audio/wav")},
+                )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json(), {"text": "hello from whisper"})
 
 
 if __name__ == "__main__":
